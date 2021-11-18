@@ -9,6 +9,18 @@
 
 'use strict';
 
+/**
+ * @typedef NormalizedOptions
+ * @property additionalHooks {RegExp | false=}
+ * @property enableDangerousAutofixThisMayCauseInfiniteLoops {boolean}
+ * @property immediateRefHooks {RegExp=}
+ * @property stableRefHooks {RegExp=}
+ * @property stableStateHooks {Map<string, number[]>=}
+ */
+
+/** @typedef {import('estree').ArrayExpression['elements'][number]} DeclaredDependenciesNode */
+
+/** */
 export default {
   meta: {
     hasSuggestions: true,
@@ -53,6 +65,10 @@ export default {
       },
     ],
   },
+  /**
+   * @param {import('eslint').Rule.RuleContext} context
+   * @returns {import('eslint').Rule.RuleListener}
+   */
   create(context) {
     // Parse the `additionalHooks` regex.
     const additionalHooks = context.options?.[0]?.additionalHooks
@@ -87,6 +103,7 @@ export default {
       stableStateHooks = new Map(entries);
     }
 
+    /** @type {NormalizedOptions} */
     const options = {
       additionalHooks,
       enableDangerousAutofixThisMayCauseInfiniteLoops,
@@ -128,6 +145,11 @@ export default {
     }
     /**
      * Visitor for both function expressions and arrow function expressions.
+     * @param {import('estree').Function & import('eslint').Rule.NodeParentExtension} node
+     * @param {DeclaredDependenciesNode} declaredDependenciesNode
+     * @param {import('estree').CallExpression['callee']} reactiveHook
+     * @param {string} reactiveHookName
+     * @param {boolean} isEffect
      */
     function visitFunctionWithDependencies(
       node,
@@ -155,6 +177,7 @@ export default {
       }
 
       // Get the current scope.
+      /** @type {import('eslint').Scope.Scope} */
       const scope = scopeManager.acquire(node);
 
       // Find all our "pure scopes". On every re-render of a component these
@@ -198,6 +221,7 @@ export default {
       // const ref = useRef()
       //       ^^^ true for this reference
       // False for everything else.
+      /** @param {import('eslint').Scope.Variable} resolved */
       function isStableKnownHookValue(resolved) {
         if (!isArray(resolved.defs)) {
           return false;
@@ -205,6 +229,23 @@ export default {
         const def = resolved.defs[0];
         if (def == null) {
           return false;
+        }
+        if (def.type === 'Parameter') {
+          const param = typeof def.name === 'object'
+            ? def.name
+            : def.node.params.find((p) => p.type === 'Identifier' && p.name === resolved.name)
+
+          if (!param) return false;
+          /** @type {import('eslint').Rule.Node} */
+          const typeName =
+            param.typeAnnotation &&
+            param.typeAnnotation.typeAnnotation &&
+            param.typeAnnotation.typeAnnotation.typeName &&
+            getNodeWithoutReactNamespace(param.typeAnnotation.typeAnnotation.typeName);
+          console.log('isStableKnownHookValue typeAnnotation', typeName && 'typeName', typeName || param.typeAnnotation);
+          if (typeName && typeName.type === 'Identifier' && typeName.name === 'RefObject') {
+            return true;
+          }
         }
         // Look for `let stuff = ...`
         if (def.node.type !== 'VariableDeclarator') {
@@ -443,6 +484,7 @@ export default {
       const optionalChains = new Map();
       gatherDependenciesRecursively(scope);
 
+      /** @param {import('eslint').Scope.Scope} currentScope */
       function gatherDependenciesRecursively(currentScope) {
         for (const reference of currentScope.references) {
           // If this reference is not resolved or it is not declared in a pure
@@ -778,10 +820,10 @@ export default {
         // If nothing else to report, check if some dependencies would
         // invalidate on every render.
         const constructions = scanForConstructions({
-          declaredDependencies,
-          declaredDependenciesNode,
-          componentScope,
-          scope,
+          declaredDependencies, // : any[]
+          declaredDependenciesNode, // : DeclaredDependenciesNode
+          componentScope, // import('eslint').Scope.Scope | null
+          scope, // : import('eslint').Scope.Scope
         });
         constructions.forEach(({ construction, isUsedOutsideOfHook, depType }) => {
           const wrapperHook = depType === 'function' ? 'useCallback' : 'useMemo';
@@ -1030,6 +1072,7 @@ export default {
       }
 
       if (!extraWarning && missingDependencies.size > 0) {
+        /** @type {any} */
         let setStateRecommendation = null;
         missingDependencies.forEach((missingDep) => {
           if (setStateRecommendation !== null) {
@@ -1299,6 +1342,14 @@ export default {
 };
 
 // The meat of the logic.
+/**
+ * @param {{
+ *   dependencies: Map<string, unknown>;
+ *   declaredDependencies: { key: string }[];
+ *   stableDependencies: Set<unknown>;
+ *   externalDependencies: Set<unknown>;
+ *   isEffect: boolean;
+ * }} param0} */
 function collectRecommendations({
   dependencies,
   declaredDependencies,
@@ -1315,6 +1366,14 @@ function collectRecommendations({
   // We'll use it to mark nodes that are *used* by the programmer,
   // and the nodes that were *declared* as deps. Then we will
   // traverse it to learn which deps are missing or unnecessary.
+  /**
+   * @typedef DepTree
+   * @property isUsed {boolean}
+   * @property isSatisfiedRecursively {boolean}
+   * @property isSubtreeUsed {boolean}
+   * @property children {Map<string, DepTree>}
+   */
+  /** @type {DepTree} */
   const depTree = createDepTree();
   function createDepTree() {
     return {
@@ -1347,6 +1406,10 @@ function collectRecommendations({
   });
 
   // Tree manipulation helpers.
+  /**
+   * @param {DepTree} rootNode
+   * @param {string} path
+   */
   function getOrCreateNodeByPath(rootNode, path) {
     const keys = path.split('.');
     let node = rootNode;
@@ -1360,6 +1423,11 @@ function collectRecommendations({
     }
     return node;
   }
+  /**
+   * @param {DepTree} rootNode
+   * @param {string} path
+   * @param {(parent: DepTree) => void} fn
+   */
   function markAllParentsByPath(rootNode, path, fn) {
     const keys = path.split('.');
     let node = rootNode;
@@ -1377,6 +1445,12 @@ function collectRecommendations({
   const missingDependencies = new Set();
   const satisfyingDependencies = new Set();
   scanTreeRecursively(depTree, missingDependencies, satisfyingDependencies, (key) => key);
+  /**
+   * @param {DepTree} node
+   * @param {Set<string>} missingPaths
+   * @param {Set<string>} satisfyingPaths
+   * @param {(key: string) => string} keyToPath
+   */
   function scanTreeRecursively(node, missingPaths, satisfyingPaths, keyToPath) {
     node.children.forEach((child, key) => {
       const path = keyToPath(key);
@@ -1451,6 +1525,7 @@ function collectRecommendations({
 
 // If the node will result in constructing a referentially unique value, return
 // its human readable type name, else return null.
+/** @param {import('estree').Node} node */
 function getConstructionExpressionType(node) {
   switch (node.type) {
     case 'ObjectExpression':
@@ -1504,6 +1579,14 @@ function getConstructionExpressionType(node) {
 
 // Finds variables declared as dependencies
 // that would invalidate on every render.
+/**
+ * @param {{
+ *   declaredDependencies: { key: string }[]
+ *   declaredDependenciesNode: DeclaredDependenciesNode
+ *   componentScope: import('eslint').Scope.Scope
+ *   scope: import('eslint').Scope.Scope
+ * }} param0
+ */
 function scanForConstructions({
   declaredDependencies,
   declaredDependenciesNode,
@@ -1592,6 +1675,8 @@ function scanForConstructions({
  * props.(foo) => (props.foo)
  * props.foo.(bar) => (props).foo.bar
  * props.foo.bar.(baz) => (props).foo.bar.baz
+ *
+ * @param {import('eslint').Rule.Node} node
  */
 function getDependency(node) {
   if (
@@ -1625,6 +1710,9 @@ function getDependency(node) {
  * Note: If the node argument is an OptionalMemberExpression, it doesn't necessarily mean it is optional.
  * It just means there is an optional member somewhere inside.
  * This particular node might still represent a required member, so check .optional field.
+ * @param {import('eslint').Rule.Node} node
+ * @param {Map<unknown, unknown> | null} optionalChains
+ * @param {string} result
  */
 function markNode(node, optionalChains, result) {
   if (optionalChains) {
@@ -1647,6 +1735,8 @@ function markNode(node, optionalChains, result) {
  * foo(.)bar -> 'foo.bar'
  * foo.bar(.)baz -> 'foo.bar.baz'
  * Otherwise throw.
+ * @param {import('eslint').Rule.Node} node
+ * @param {Map<unknown, unknown> | null} optionalChains
  */
 function analyzePropertyChain(node, optionalChains) {
   if (node.type === 'Identifier' || node.type === 'JSXIdentifier') {
@@ -1669,6 +1759,7 @@ function analyzePropertyChain(node, optionalChains) {
     markNode(node, optionalChains, result);
     return result;
   } else if (node.type === 'ChainExpression' && !node.computed) {
+    /** @type {Extract<import('eslint').Rule.Node, { type: 'CallExpression' } | { type: 'MemberExpression' }>} */
     const expression = node.expression;
 
     if (expression.type === 'CallExpression') {
@@ -1694,6 +1785,14 @@ function getNodeWithoutReactNamespace(node, options) {
     !node.computed
   ) {
     return node.property;
+  }
+  if (
+    node.type === 'TSQualifiedName' &&
+    node.left.type === 'Identifier' &&
+    node.left.name === 'React' &&
+    node.right.type === 'Identifier'
+  ) {
+    return node.right;
   }
   return node;
 }
@@ -1740,6 +1839,7 @@ function getReactiveHookCallbackIndex(calleeNode, options) {
 }
 
 // Is the return value of hook stable?
+/** @param {string} name @param {NormalizedOptions} options */
 function isStableRefHookName(name, options) {
   switch (name) {
     case 'useRef':
